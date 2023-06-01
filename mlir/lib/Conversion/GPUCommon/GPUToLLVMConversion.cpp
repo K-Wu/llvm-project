@@ -1483,6 +1483,28 @@ LogicalResult ConvertSpMVOpToGpuRuntimeCallPattern::matchAndRewrite(
   return success();
 }
 
+static bool is50PercentSparsity(Value spMat) {
+  // TODO: DefaultValuedAttr<BoolAttr, "true">
+  if (auto op = spMat.getDefiningOp<gpu::CreateCooOp>())
+    return op.getFlag2to4();
+  if (auto op = spMat.getDefiningOp<gpu::CreateCsrOp>())
+    return op.getFlag2to4();
+  llvm_unreachable("cannot find spmat def");
+}
+}
+
+static const char *inferSpMMType(Operation op) {
+  for (Operation *user : op.getUsers()) {
+    auto spmmOp = dyn_cast<gpu::SpMMOp>(user);
+    // if the other operator is 50% sparsity then we should use cusparseLt
+    if (!spmmOp)
+      continue;
+    if (is50PercentSparsity(spmmOp.getSpMatA()))
+      return "cusparseLt";
+  }
+  return "cusparse";
+}
+
 LogicalResult ConvertSpMMBufferSizeOpToGpuRuntimeCallPattern::matchAndRewrite(
     gpu::SpMMBufferSizeOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {

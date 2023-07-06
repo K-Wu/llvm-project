@@ -688,7 +688,7 @@ void GpuToLLVMConversionPass::runOnOperation() {
   RewritePatternSet patterns(&getContext());
   LLVMConversionTarget target(getContext());
 
-  target.addIllegalDialect<gpu::GPUDialect>();
+  // target.addIllegalDialect<gpu::GPUDialect>();
 
   mlir::arith::populateArithToLLVMConversionPatterns(converter, patterns);
   mlir::cf::populateControlFlowToLLVMConversionPatterns(converter, patterns);
@@ -1868,27 +1868,24 @@ static Value genTensorToMemref(PatternRewriter &rewriter, Location loc,
   return rewriter.create<bufferization::ToMemrefOp>(loc, memrefType, tensor);
 }
 
-// static LogicalResult rewriteCustomOp(PatternRewriter &rewriter,
-//                                      linalg::GenericOp op, bool enableRT) {
 LogicalResult ConvertCustomOpToGpuRuntimeCallPattern::matchAndRewrite(
     gpu::CustomOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   Location loc = op.getLoc();
-  Value C = adaptor.getC();
-  Value B = adaptor.getB();
-  Value A = adaptor.getA();
-  // Value C = op.getInputs()[0];
-  // Value A = op.getInputs()[1];
-  // Value B = op.getInputs()[2];
-  //  For now, lower to GPU directly.
+  Value C = op.getC();
+  Value B = op.getB();
+  Value A = op.getA();
 
   SmallVector<Value> tokens;
-  Value bufA = genTensorToMemref(rewriter, loc, A);
-  Value matA = genAllocCopy(rewriter, loc, bufA, tokens);
-  Value bufB = genTensorToMemref(rewriter, loc, B);
-  Value matB = genAllocCopy(rewriter, loc, bufB, tokens);
-  Value bufC = genTensorToMemref(rewriter, loc, C);
-  Value matC = genAllocCopy(rewriter, loc, bufC, tokens);
+  Value firstToken = genFirstWait(rewriter, loc);
+  auto COutAlloc = genAllocMemRef(rewriter, loc, C, firstToken);
+  Value COut = COutAlloc.getResult(0);
+  Value depToken = COutAlloc.getAsyncToken(); // copy-after-alloc
+  tokens.push_back(depToken);
+
+  Value matA = genAllocCopy(rewriter, loc, A, tokens);
+  Value matB = genAllocCopy(rewriter, loc, B, tokens);
+  Value matC = genAllocCopy(rewriter, loc, C, tokens);
   genBlockingWait(rewriter, loc, tokens);
   tokens.clear();
   Value szm = linalg::createOrFoldDimOp(rewriter, loc, matA, 0);
@@ -1918,21 +1915,36 @@ LogicalResult ConvertCustomOpToGpuRuntimeCallPattern::matchAndRewrite(
 
   auto dmatCType = llvm::cast<ShapedType>(matC.getType()).getElementType();
 
+  // create buffer type array
+  TypeRange bufferTypes({indexTp, indexTp, indexTp});
   // Precompute buffersize for SpMM.
   auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
-      loc, indexTp, tokenTp, token, spMatA, dnB, dnC,
+      loc, bufferTypes, tokenTp, token, gpu::TransposeMode::NON_TRANSPOSE,
+      gpu::TransposeMode::NON_TRANSPOSE, spMatA, dnB, dnC,
       /*computeType=*/dmatCType);
+
   Value bufferSz = bufferComp.getResult(0);
-  token = bufferComp.getAsyncToken();
+  token = bufferComp.getResult(3);
   auto buf = genAllocBuffer(rewriter, loc, bufferSz, token);
   Value buffer = buf.getResult(0);
   token = buf.getAsyncToken();
+
+  Value bufferSz2 = bufferComp.getResult(1);
+  auto buf2 = genAllocBuffer(rewriter, loc, bufferSz2, token);
+  Value buffer2 = buf2.getResult(0);
+  token = buf2.getAsyncToken();
+
+  Value bufferSz3 = bufferComp.getResult(2);
+  auto buf3 = genAllocBuffer(rewriter, loc, bufferSz3, token);
+  Value buffer3 = buf3.getResult(0);
+  token = buf3.getAsyncToken();
 
   auto dnCType = llvm::cast<ShapedType>(matC.getType()).getElementType();
 
   // Perform the SpMM.
   auto spmmComp = rewriter.create<gpu::SpMMOp>(
-      loc, tokenTp, token, spMatA, dnB, dnC, /*computeType=*/dnCType, buffer);
+      loc, tokenTp, token, spMatA, dnB, dnC, /*computeType=*/dnCType,
+      SmallVector{buffer, buffer2, buffer3});
   token = spmmComp.getAsyncToken();
 
   // Copy data back to host and free all the resources.
@@ -1942,12 +1954,18 @@ LogicalResult ConvertCustomOpToGpuRuntimeCallPattern::matchAndRewrite(
               .getAsyncToken();
   token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnC)
               .getAsyncToken();
+
+  token = genDeallocMemRef(rewriter, loc, buffer, token);
+  token = genDeallocMemRef(rewriter, loc, buffer2, token);
+  token = genDeallocMemRef(rewriter, loc, buffer3, token);
+  token = genDeallocMemRef(rewriter, loc, matA, token);
   token = genDeallocMemRef(rewriter, loc, matB, token);
-  token = genCopyMemRef(rewriter, loc, bufC, matC, token);
+  token = genCopyMemRef(rewriter, loc, COut /*bufC*/, matC, token);
   token = genDeallocMemRef(rewriter, loc, matC, token);
   tokens.push_back(token);
   genBlockingWait(rewriter, loc, tokens);
   tokens.clear();
+  rewriter.replaceOp(op, {COut, token});
   return success();
 }
 
@@ -1983,7 +2001,7 @@ void mlir::populateGpuToLLVMConversionPatterns(LLVMTypeConverter &converter,
                ConvertSpMMOpToGpuRuntimeCallPattern,
                ConvertSDDMMBufferSizeOpToGpuRuntimeCallPattern,
                ConvertSDDMMOpToGpuRuntimeCallPattern>(converter);
-  patterns.add<ConvertLaunchFuncOpToGpuRuntimeCallPattern>(
-      converter, gpuBinaryAnnotation, kernelBarePtrCallConv);
-  patterns.add<EraseGpuModuleOpPattern>(&converter.getContext());
+  // patterns.add<ConvertLaunchFuncOpToGpuRuntimeCallPattern>(
+  //     converter, gpuBinaryAnnotation, kernelBarePtrCallConv);
+  // patterns.add<EraseGpuModuleOpPattern>(&converter.getContext());
 }

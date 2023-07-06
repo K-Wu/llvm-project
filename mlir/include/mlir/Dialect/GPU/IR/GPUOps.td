@@ -2060,7 +2060,7 @@ def GPU_SDDMMBufferSizeOp : GPU_Op<"sddmm_buffer_size", [GPU_AsyncOpInterface]> 
 
 
 
-def GPU_CustomOp : GPU_Op<"sddmm", [GPU_AsyncOpInterface]> {
+def GPU_CustomOp : GPU_Op<"customop", [GPU_AsyncOpInterface]> {
   let summary = "Custom operation";
   let description = [{
     Custom operation for debug purpose
@@ -2071,11 +2071,11 @@ def GPU_CustomOp : GPU_Op<"sddmm", [GPU_AsyncOpInterface]> {
                    AnyMemRef:$A,
                   AnyMemRef:$B,
                   AnyMemRef:$C);
-  let results = (outs Optional<GPU_AsyncToken>:$asyncToken);
+  let results = (outs AnyMemRef:$COut, Optional<GPU_AsyncToken>:$asyncToken);
 
   let assemblyFormat = [{
     custom<AsyncDependencies>(type($asyncToken), $asyncDependencies)
-    $A  `,` $B `,` $C  attr-dict `:` type($A) `and` type($B) `into` type($C)
+    $A  `,` $B `,` $C  attr-dict `:` type($A) `and` type($B) `and` type($C) `into` type($COut)
   }];
 }
 

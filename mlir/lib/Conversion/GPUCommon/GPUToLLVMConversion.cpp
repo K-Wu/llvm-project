@@ -25,9 +25,11 @@
 #include "mlir/Conversion/MemRefToLLVM/MemRefToLLVM.h"
 #include "mlir/Conversion/VectorToLLVM/ConvertVectorToLLVM.h"
 #include "mlir/Dialect/Async/IR/Async.h"
+#include "mlir/Dialect/Bufferization/IR/Bufferization.h"
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/Dialect/GPU/Transforms/Passes.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/Linalg/Utils/Utils.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Attributes.h"
 #include "mlir/IR/Builders.h"
@@ -660,6 +662,18 @@ public:
 private:
   LogicalResult
   matchAndRewrite(gpu::SDDMMOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+class ConvertCustomOpToGpuRuntimeCallPattern
+    : public ConvertOpToGpuRuntimeCallPattern<gpu::CustomOp> {
+public:
+  ConvertCustomOpToGpuRuntimeCallPattern(LLVMTypeConverter &typeConverter)
+      : ConvertOpToGpuRuntimeCallPattern<gpu::CustomOp>(typeConverter) {}
+
+private:
+  LogicalResult
+  matchAndRewrite(gpu::CustomOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 
@@ -1777,6 +1791,166 @@ LogicalResult ConvertSDDMMOpToGpuRuntimeCallPattern::matchAndRewrite(
   return success();
 }
 
+/// Generates first wait in an asynchronous chain.
+static Value genFirstWait(OpBuilder &builder, Location loc) {
+  Type tokenType = builder.getType<gpu::AsyncTokenType>();
+  return builder.create<gpu::WaitOp>(loc, tokenType, ValueRange())
+      .getAsyncToken();
+}
+
+/// Generates last, blocking wait in an asynchronous chain.
+static void genBlockingWait(OpBuilder &builder, Location loc,
+                            ValueRange operands) {
+  builder.create<gpu::WaitOp>(loc, Type(), operands);
+}
+
+/// Allocates memory on the device.
+/// TODO: A `host_shared` attribute could be used to indicate that
+///       the buffer is visible by both host and device, but lowering
+///       that feature does not seem to be fully supported yet.
+static gpu::AllocOp genAllocMemRef(OpBuilder &builder, Location loc, Value mem,
+                                   Value token) {
+  auto tp = cast<ShapedType>(mem.getType());
+  auto elemTp = tp.getElementType();
+  auto shape = tp.getShape();
+  auto memTp = MemRefType::get(shape, elemTp);
+  SmallVector<Value> dynamicSizes;
+  for (unsigned r = 0, rank = tp.getRank(); r < rank; r++) {
+    if (shape[r] == ShapedType::kDynamic) {
+      Value dimOp = linalg::createOrFoldDimOp(builder, loc, mem, r);
+      dynamicSizes.push_back(dimOp);
+    }
+  }
+  return builder.create<gpu::AllocOp>(loc, TypeRange({memTp, token.getType()}),
+                                      token, dynamicSizes, ValueRange());
+}
+
+// Allocates a void buffer on the device with given size.
+static gpu::AllocOp genAllocBuffer(OpBuilder &builder, Location loc, Value size,
+                                   Value token) {
+  const auto memTp =
+      MemRefType::get({ShapedType::kDynamic}, builder.getI8Type());
+  return builder.create<gpu::AllocOp>(loc, TypeRange({memTp, token.getType()}),
+                                      token, size, ValueRange());
+}
+
+/// Deallocates memory from the device.
+static Value genDeallocMemRef(OpBuilder &builder, Location loc, Value mem,
+                              Value token) {
+  return builder.create<gpu::DeallocOp>(loc, token.getType(), token, mem)
+      .getAsyncToken();
+}
+
+/// Copies memory between host and device (direction is implicit).
+static Value genCopyMemRef(OpBuilder &builder, Location loc, Value dst,
+                           Value src, Value token) {
+  return builder.create<gpu::MemcpyOp>(loc, token.getType(), token, dst, src)
+      .getAsyncToken();
+}
+
+/// Generates an alloc/copy pair.
+static Value genAllocCopy(OpBuilder &builder, Location loc, Value b,
+                          SmallVectorImpl<Value> &tokens) {
+  Value firstToken = genFirstWait(builder, loc);
+  auto alloc = genAllocMemRef(builder, loc, b, firstToken);
+  Value devMem = alloc.getResult(0);
+  Value depToken = alloc.getAsyncToken(); // copy-after-alloc
+  tokens.push_back(genCopyMemRef(builder, loc, devMem, b, depToken));
+  return devMem;
+}
+
+/// Generates a memref from tensor operation.
+static Value genTensorToMemref(PatternRewriter &rewriter, Location loc,
+                               Value tensor) {
+  auto tensorType = llvm::cast<ShapedType>(tensor.getType());
+  auto memrefType =
+      MemRefType::get(tensorType.getShape(), tensorType.getElementType());
+  return rewriter.create<bufferization::ToMemrefOp>(loc, memrefType, tensor);
+}
+
+// static LogicalResult rewriteCustomOp(PatternRewriter &rewriter,
+//                                      linalg::GenericOp op, bool enableRT) {
+LogicalResult ConvertCustomOpToGpuRuntimeCallPattern::matchAndRewrite(
+    gpu::CustomOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  Location loc = op.getLoc();
+  Value C = adaptor.getC();
+  Value B = adaptor.getB();
+  Value A = adaptor.getA();
+  // Value C = op.getInputs()[0];
+  // Value A = op.getInputs()[1];
+  // Value B = op.getInputs()[2];
+  //  For now, lower to GPU directly.
+
+  SmallVector<Value> tokens;
+  Value bufA = genTensorToMemref(rewriter, loc, A);
+  Value matA = genAllocCopy(rewriter, loc, bufA, tokens);
+  Value bufB = genTensorToMemref(rewriter, loc, B);
+  Value matB = genAllocCopy(rewriter, loc, bufB, tokens);
+  Value bufC = genTensorToMemref(rewriter, loc, C);
+  Value matC = genAllocCopy(rewriter, loc, bufC, tokens);
+  genBlockingWait(rewriter, loc, tokens);
+  tokens.clear();
+  Value szm = linalg::createOrFoldDimOp(rewriter, loc, matA, 0);
+  Value szk = linalg::createOrFoldDimOp(rewriter, loc, matB, 1);
+  Value szn = linalg::createOrFoldDimOp(rewriter, loc, matC, 1);
+
+  Type indexTp = rewriter.getIndexType();
+  Type dnTensorHandleTp = rewriter.getType<gpu::SparseDnTensorHandleType>();
+  Type spMatHandleTp = rewriter.getType<gpu::SparseSpMatHandleType>();
+  Type tokenTp = rewriter.getType<gpu::AsyncTokenType>();
+  Value token = genFirstWait(rewriter, loc);
+  Operation *spGenA = rewriter.create<gpu::Create2To4SpMatOp>(
+      loc, spMatHandleTp, tokenTp, token, szm, szk, matA);
+
+  Value spMatA = spGenA->getResult(0);
+  token = spGenA->getResult(1);
+  auto dmatB = rewriter.create<gpu::CreateDnTensorOp>(
+      loc, dnTensorHandleTp, tokenTp, token, matB,
+      SmallVector<Value>{szk, szn});
+  Value dnB = dmatB.getResult(0);
+  token = dmatB.getAsyncToken();
+  auto dmatC = rewriter.create<gpu::CreateDnTensorOp>(
+      loc, dnTensorHandleTp, tokenTp, token, matC,
+      SmallVector<Value>{szm, szn});
+  Value dnC = dmatC.getResult(0);
+  token = dmatC.getAsyncToken();
+
+  auto dmatCType = llvm::cast<ShapedType>(matC.getType()).getElementType();
+
+  // Precompute buffersize for SpMM.
+  auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
+      loc, indexTp, tokenTp, token, spMatA, dnB, dnC,
+      /*computeType=*/dmatCType);
+  Value bufferSz = bufferComp.getResult(0);
+  token = bufferComp.getAsyncToken();
+  auto buf = genAllocBuffer(rewriter, loc, bufferSz, token);
+  Value buffer = buf.getResult(0);
+  token = buf.getAsyncToken();
+
+  auto dnCType = llvm::cast<ShapedType>(matC.getType()).getElementType();
+
+  // Perform the SpMM.
+  auto spmmComp = rewriter.create<gpu::SpMMOp>(
+      loc, tokenTp, token, spMatA, dnB, dnC, /*computeType=*/dnCType, buffer);
+  token = spmmComp.getAsyncToken();
+
+  // Copy data back to host and free all the resources.
+  token = rewriter.create<gpu::DestroySpMatOp>(loc, tokenTp, token, spMatA)
+              .getAsyncToken();
+  token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnB)
+              .getAsyncToken();
+  token = rewriter.create<gpu::DestroyDnTensorOp>(loc, tokenTp, token, dnC)
+              .getAsyncToken();
+  token = genDeallocMemRef(rewriter, loc, matB, token);
+  token = genCopyMemRef(rewriter, loc, bufC, matC, token);
+  token = genDeallocMemRef(rewriter, loc, matC, token);
+  tokens.push_back(token);
+  genBlockingWait(rewriter, loc, tokens);
+  tokens.clear();
+  return success();
+}
+
 void mlir::populateGpuToLLVMConversionPatterns(LLVMTypeConverter &converter,
                                                RewritePatternSet &patterns,
                                                StringRef gpuBinaryAnnotation,
@@ -1785,7 +1959,8 @@ void mlir::populateGpuToLLVMConversionPatterns(LLVMTypeConverter &converter,
   addOpaquePointerConversion<gpu::SparseDnTensorHandleType>(converter);
   addOpaquePointerConversion<gpu::SparseSpMatHandleType>(converter);
 
-  patterns.add<ConvertAllocOpToGpuRuntimeCallPattern,
+  patterns.add<ConvertCustomOpToGpuRuntimeCallPattern,
+               ConvertAllocOpToGpuRuntimeCallPattern,
                ConvertDeallocOpToGpuRuntimeCallPattern,
                ConvertHostRegisterOpToGpuRuntimeCallPattern,
                ConvertHostUnregisterOpToGpuRuntimeCallPattern,

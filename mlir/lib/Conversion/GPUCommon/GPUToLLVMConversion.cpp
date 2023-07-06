@@ -1916,7 +1916,7 @@ LogicalResult ConvertCustomOpToGpuRuntimeCallPattern::matchAndRewrite(
   auto dmatCType = llvm::cast<ShapedType>(matC.getType()).getElementType();
 
   // create buffer type array
-  TypeRange bufferTypes({indexTp, indexTp, indexTp});
+  TypeRange bufferTypes(SmallVector<Type>{indexTp, indexTp, indexTp});
   // Precompute buffersize for SpMM.
   auto bufferComp = rewriter.create<gpu::SpMMBufferSizeOp>(
       loc, bufferTypes, tokenTp, token, gpu::TransposeMode::NON_TRANSPOSE,
